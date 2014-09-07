@@ -6,7 +6,7 @@
 // -mode VCF filter design featured in thier Anushri synth.
 // VCF cutoff control via MCP4921 12-bit SPI DAC
 // VCF resonance control via MCP4131 100K 128-step digital pot
-/* version 1.1
+/* version 1.2
  
  working in this version:
  note on/off handling
@@ -20,11 +20,15 @@
  VCA envelope (using built-in attenuators)
  glide
  MIDI channel set
- VCF envelope 
+ VCF envelope
+ VCF cutoff tracking
  
  to do:
- vcf cutoff tracking
- vibrato
+ real vibrato
+ 
+ Note:
+ There is VCF CV bleedthrough into the audio when attack is zero.
+ I mitigate this somewhat by "resting" the CV voltage a midway when between notes.
  
  */
 
@@ -142,6 +146,8 @@
 
 // VCF CV where no audio is audible
 #define MIN_VCF_CUTOFF 2046
+// VCF CV halfway
+#define HALF_VCF_CUTOFF 1024
 // VCF CV where highest frequencies are passed
 #define MAX_VCF_CUTOFF 0
 
@@ -434,11 +440,17 @@ float vcfRChangePerTick;
 // reduces the VCF envelope amplitude from maximum
 // set the default here; 0 - 127
 byte vcfDepthValue = 127;
+// VCF depth offset (for note tracking)
+float vcfDepthOffset = 0.0;
 // VCF depth setting
 float vcfDepth;
 // VCF resonance setting
 // we are using a 7-bit digital pot so this value can be used directly
 byte vcfResonanceValue = 0;
+// VCF CV keyboard tracking mode
+// 0 off; 1 on
+byte vcfCutoffTrackingValue = 0;
+byte vcfCutoffTracking = 0;
 
 
 // VCA tick counter
@@ -738,13 +750,16 @@ void doNoteOn(byte channel, byte pitch, byte velocity)
   // compute the actual value to send to the DAC after multiplying by the depth factor
   // vcfCutoffOutput = (int)(MIN_VCF_CUTOFF - ((vcfDepthValue / 127.0f) * vcfCutoff));
   // write the value to the DAC
-  dac.output(MIN_VCF_CUTOFF);
+  dac.output(HALF_VCF_CUTOFF);
   
   // set the VCF resonance digital pot
   digitalWrite(POT_CS_PIN, LOW);
   delayMicroseconds(COMMAND_DELAY);
   SPI.transfer(POT_0);
   SPI.transfer(vcfResonanceValue);
+  
+  // calculate the VCF offset for the pitch
+  vcfDepthOffset = vcfCutoffOffset(pitch);
   
   digitalWrite(POT_CS_PIN, HIGH);
 
@@ -936,7 +951,7 @@ void doNoteOff(byte channel, byte pitch, byte velocity)
     delayMicroseconds(COMMAND_DELAY);
     digitalWrite(POT_CS_PIN, HIGH);
     // set the cutoff to minimum
-    dac.output(MIN_VCF_CUTOFF);
+    dac.output(HALF_VCF_CUTOFF);
     // handle the note - the vca and vcf envelopes will be restarted
     doNoteOn(channel, notes[0].myPitch, notes[0].myVelocity);
   }
@@ -1110,7 +1125,8 @@ void doCC(byte channel, byte ccnumber, byte ccvalue)
       vcfDepthValue = ccvalue;
       // VCF cutoff CV is inverse of setting, ie. max voltage is minimum cutoff (lowest frequency)
       // we want maxiumum depth to have zero attenuation of the VCF cutoff envelope
-      vcfCutoffOutput = MIN_VCF_CUTOFF - (int)((float)(vcfDepthValue / 127.00) * vcfCutoff);
+      vcfCutoffOutput = MIN_VCF_CUTOFF - (int)(((vcfDepthValue - vcfDepthOffset) / 127.0f) * vcfCutoff);
+      // vcfCutoffOutput = MIN_VCF_CUTOFF - (int)((float)(vcfDepthValue / 127.00) * vcfCutoff);
       // write an updated value to the VCF cutoff DAC based on the update value
       dac.output(vcfCutoffOutput);
       break;
@@ -1188,6 +1204,21 @@ void doCC(byte channel, byte ccnumber, byte ccvalue)
         glideMode = 2;
       }
       break;
+    // MIDI CC 90 - filter tracking
+    // 0 - 63 off
+    // 64 - 127 on
+    case 90:
+      vcfCutoffTrackingValue = ccvalue;
+      if (vcfCutoffTrackingValue < 64)
+      {
+        vcfCutoffTracking = 0;
+      }
+      else
+      {
+        vcfCutoffTracking = 1;
+      }
+      break;
+    
       
     // default
     default:
@@ -1375,7 +1406,7 @@ void doVCA(void)
       // set the cutoff to zero
       vcfCutoff = 0;
       // set the DAC to the lowest cutoff frequency
-      dac.output(MIN_VCF_CUTOFF);
+      dac.output(HALF_VCF_CUTOFF);
       // move to the default state
       vcaEnvState = STATE_0;
       return;
@@ -1427,7 +1458,7 @@ void doVCA(void)
       // set the cutoff to zero
       vcfCutoff = 0;
       // set the DAC to the lowest cutoff frequency
-      dac.output(MIN_VCF_CUTOFF);
+      dac.output(HALF_VCF_CUTOFF);
       // move to the default state
       vcaEnvState = STATE_0;
     }
@@ -1469,7 +1500,7 @@ void doVCF(void)
         // set vcfCutoff to max level
         vcfCutoff = MIN_VCF_CUTOFF;
         // compute the actual value to send to the DAC after multiplying by the depth factor
-        vcfCutoffOutput = (int)(MIN_VCF_CUTOFF - ((vcfDepthValue / 127.0f) * vcfCutoff));
+        vcfCutoffOutput = (int)(MIN_VCF_CUTOFF - ((vcfDepthValue - vcfDepthOffset) / 127.0f) * vcfCutoff);
         // write the value to the DAC
         dac.output(vcfCutoffOutput);
         // reset the vcaTickCount to zero
@@ -1489,7 +1520,7 @@ void doVCF(void)
   
       // set the VCF cutoff on each pass
       // apply the cutoff depth and invert the values    
-      vcfCutoffOutput = MIN_VCF_CUTOFF - (int)((vcfDepthValue / 127.0f) * vcfCutoff);
+      vcfCutoffOutput = MIN_VCF_CUTOFF - (int)(((vcfDepthValue - vcfDepthOffset) / 127.0f) * vcfCutoff);
       // write the value to the DAC
       dac.output(vcfCutoffOutput);
   
@@ -1535,7 +1566,7 @@ void doVCF(void)
         // set the cutoff equal to the sustain level
         vcfCutoff = vcfSLevel;
         // apply the cutoff depth and invert the values    
-        vcfCutoffOutput = (int)(MIN_VCF_CUTOFF - ((vcfDepthValue / 127.0f) * vcfCutoff));
+        vcfCutoffOutput = (int)(MIN_VCF_CUTOFF - (((vcfDepthValue - vcfDepthOffset) / 127.0f) * vcfCutoff));
         // write the value to the DAC
         dac.output(vcfCutoffOutput);
         // reset the vcaTickCount to zero
@@ -1547,7 +1578,7 @@ void doVCF(void)
   
       // set the VCF cutoff on each pass    
       // apply the cutoff depth and invert the values    
-      vcfCutoffOutput = MIN_VCF_CUTOFF - (int)((vcfDepthValue / 127.0f) * vcfCutoff);
+      vcfCutoffOutput = MIN_VCF_CUTOFF - (int)(((vcfDepthValue - vcfDepthOffset) / 127.0f) * vcfCutoff);
       // write the value to the DAC
       dac.output(vcfCutoffOutput);
   
@@ -1574,7 +1605,7 @@ void doVCF(void)
         }
         
         // apply the cutoff depth and invert the values    
-        vcfCutoffOutput = MIN_VCF_CUTOFF - (int)((vcfDepthValue / 127.0f) * vcfCutoff);
+        vcfCutoffOutput = MIN_VCF_CUTOFF - (int)(((vcfDepthValue - vcfDepthOffset) / 127.0f) * vcfCutoff);
         // write the value to the DAC
         dac.output(vcfCutoffOutput);
   
@@ -1614,7 +1645,7 @@ void doVCF(void)
   
       // set the VCF cutoff on each pass    
       // apply the cutoff depth and invert the values    
-      vcfCutoffOutput = MIN_VCF_CUTOFF - (int)((vcfDepthValue / 127.0f) * vcfCutoff);
+      vcfCutoffOutput = MIN_VCF_CUTOFF - (int)(((vcfDepthValue - vcfDepthOffset) / 127.0f) * vcfCutoff);
       // write the value to the DAC
       dac.output(vcfCutoffOutput);
   
@@ -1655,6 +1686,33 @@ void doVCF(void)
       break;
   }  
 }
+
+//---------------------------------------------------------------------------------------------//
+// function vcfCutoffOffset
+//---------------------------------------------------------------------------------------------//
+float vcfCutoffOffset(byte pitch)
+{
+  float offset;
+  
+  // if tracking is eisabled don't calculate anything
+  // just return 0
+  if (vcfCutoffTracking == 0)
+  {
+    return 0;
+  }
+  
+  // calculate the offset
+  // it doesn't try to stay in tune with equal temperment
+  offset = 127.0 - ((0.625 * pitch) + 70.0);
+  
+  // if the offset is somehow negative return 0
+  if ((vcfDepthValue - offset) < 0)
+  {
+    offset = 0;
+  }
+  return offset;
+}
+
 
 //---------------------------------------------------------------------------------------------//
 // function writeSN76489
